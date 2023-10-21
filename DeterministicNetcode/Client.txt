@@ -1,0 +1,93 @@
+﻿using System;
+using System.Net;
+using System.Net.Sockets;
+
+namespace DeterministicNetcode;
+
+public class Client : IDisposable
+{
+    private const string ServerIp = "localhost";
+    private const int ServerPort = 8484;
+    private const int BufferSize = 1024;
+    // Contains length (not including header length) and type.
+    private const int PacketHeaderLength = sizeof(int) * 2;
+
+    public delegate void PacketHandler(int type, Span<byte> bytes);
+
+    private readonly TcpClient _tcpClient = new();
+    private readonly NetworkStream _networkStream;
+    private readonly byte[] _buffer = new byte[BufferSize];
+    private readonly ArrayList<byte> _queuedBytes = new();
+
+    private readonly PacketHandler[] _packetHandlers;
+
+    public Client(PacketHandler[] packetHandlers)
+    {
+        _packetHandlers = packetHandlers;
+
+        var ipHostInfo = Dns.GetHostEntry(ServerIp);
+        var ipAddress = ipHostInfo.AddressList[0];
+        var ipEndPoint = new IPEndPoint(ipAddress, ServerPort);
+
+        _tcpClient.Connect(ipEndPoint);
+        _networkStream = _tcpClient.GetStream();
+    }
+
+    public void Send(int type, Span<byte> bytes)
+    {
+        if (bytes.Length + PacketHeaderLength > BufferSize)
+            throw new ArgumentException($"Overflow trying to send {bytes.Length + PacketHeaderLength} bytes!");
+
+        var destinationSpan = new Span<byte>(_buffer, PacketHeaderLength, bytes.Length);
+        bytes.CopyTo(destinationSpan);
+        BitConverter.TryWriteBytes(new Span<byte>(_buffer, 0, sizeof(int)), bytes.Length);
+        BitConverter.TryWriteBytes(new Span<byte>(_buffer, sizeof(int), sizeof(int)), type);
+
+        _networkStream.Write(_buffer, 0, bytes.Length + PacketHeaderLength);
+    }
+
+    public void Poll()
+    {
+        if (!_networkStream.DataAvailable) return;
+
+        var readByteCount = _networkStream.Read(_buffer, 0, (int)_networkStream.Length);
+
+        // Append the newly read bytes to queuedBytes.
+        var readSpan = new Span<byte>(_buffer, 0, readByteCount);
+        var destinationOffset = _queuedBytes.Count;
+        _queuedBytes.Count += readSpan.Length;
+        var destinationSpan = new Span<byte>(_queuedBytes.Array, destinationOffset, readSpan.Length);
+        readSpan.CopyTo(destinationSpan);
+
+        // Only try to process a packet when there are enough bytes available for there to be
+        // a length (int) and a packet type (int).
+        while (_queuedBytes.Count >= PacketHeaderLength)
+        {
+            var packetLength = BitConverter.ToInt32(_queuedBytes.Array, 0);
+            var packetLengthWithHeader = packetLength + PacketHeaderLength;
+            if (_queuedBytes.Count < packetLengthWithHeader) break;
+
+            var packetType = BitConverter.ToInt32(_queuedBytes.Array, sizeof(int));
+            HandlePacket(packetType, new Span<byte>(_queuedBytes.Array, PacketHeaderLength, packetLength));
+
+            // Shift the bytes that haven't been read yet to the start of the queued byte list.
+            var trailingQueuedBytes = _queuedBytes.Count - packetLengthWithHeader;
+            var trailingSpan = new Span<byte>(_queuedBytes.Array, packetLengthWithHeader, trailingQueuedBytes);
+            trailingSpan.CopyTo(_queuedBytes.Array);
+            _queuedBytes.Count = trailingQueuedBytes;
+        }
+    }
+
+    private void HandlePacket(int type, Span<byte> bytes)
+    {
+        if (type >= _packetHandlers.Length) return;
+
+        _packetHandlers[type](type, bytes);
+    }
+
+    public void Dispose()
+    {
+        _tcpClient.Dispose();
+        _networkStream?.Dispose();
+    }
+}

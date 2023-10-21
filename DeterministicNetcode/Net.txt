@@ -1,0 +1,289 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+
+namespace DeterministicNetcode;
+
+public class NetHost : INetPeer
+{
+    public struct Address
+    {
+        public string Ip;
+        public int Port;
+    }
+
+    // Game creation flow:
+    // Host creates lobby,
+    // peers join by saying hello,
+    // host tries to start the game,
+    // host creates add peers message,
+    // host sends add peers message to all peers,
+    // host keeps resending until all peers have acknowledged or timeout is reached,
+    // any peers who haven't acknowledged get removed,
+    // the game can now begin.
+    public enum State
+    {
+        InLobby,
+        StartingGame,
+        InGame
+    }
+
+    public enum PacketType : byte
+    {
+        Hello,
+        Message,
+        AddPeers,
+        Acknowledge
+    }
+
+    private const int BufferSize = 1024;
+    private const int MaxPeers = 4;
+
+    public readonly int Port;
+
+    // Non-hosts will have a stored host end point.
+    public bool IsHost => _hostEndPoint is null;
+
+    private readonly byte[] _buffer = new byte[BufferSize];
+    private readonly UdpClient _udpClient;
+    private readonly EndPoint _hostEndPoint;
+    private readonly EndPoint _localEndPoint;
+    // Used to store the result of ReceiveFrom.
+    private EndPoint _cachedEndPoint = new IPEndPoint(IPAddress.Any, 0);
+
+    private readonly HashSet<EndPoint> _peers = new();
+
+    private State _state = State.InLobby;
+
+    public NetHost(Address? hostAddress = null)
+    {
+        var endPoint = new IPEndPoint(IPAddress.Any, 0);
+        _udpClient = new UdpClient(endPoint);
+
+        var localEndPoint = (IPEndPoint)_udpClient.Client.LocalEndPoint;
+        if (localEndPoint is null)
+        {
+            throw new NullReferenceException("Socket has no end point!");
+        }
+        Port = localEndPoint.Port;
+        _localEndPoint = localEndPoint;
+
+        if (hostAddress is not null)
+        {
+            _hostEndPoint = CreateIpEndPoint(hostAddress.Value.Ip, hostAddress.Value.Port);
+            _peers.Add(_hostEndPoint);
+        }
+    }
+
+    public void SendMessageToAll(string message)
+    {
+        _buffer[0] = (byte)PacketType.Message;
+        Encoding.ASCII.GetBytes(message, new Span<byte>(_buffer, 1, message.Length));
+        SendFromBuffer(message.Length + 1);
+    }
+
+    private void SendHelloToHost()
+    {
+        _buffer[0] = (byte)PacketType.Hello;
+        SendFromBuffer(1, true);
+    }
+
+    private void SendAddPeersToAll()
+    {
+        _buffer[0] = (byte)PacketType.AddPeers;
+        _buffer[1] = (byte)_peers.Count;
+
+        var currentOffset = 2;
+
+        foreach (var peer in _peers)
+        {
+            var bytesWritten = WritePeerToBuffer(peer, currentOffset);
+
+            if (bytesWritten == 0)
+            {
+                // Failed to write the peer to the buffer.
+                return;
+            }
+
+            currentOffset += bytesWritten;
+        }
+
+        SendFromBuffer(currentOffset);
+    }
+
+    private int WritePeerToBuffer(EndPoint peer, int offset)
+    {
+        if (peer is not IPEndPoint ipEndPoint)
+        {
+            Console.WriteLine($"Peer couldn't be converted to an IP endpoint: {peer}");
+            return 0;
+        }
+
+        var ipEndPointString = ipEndPoint.ToString();
+
+        _buffer[offset] = (byte)ipEndPointString.Length;
+        offset++;
+
+        var destinationSpan = new Span<byte>(_buffer, offset, _buffer.Length - offset);
+        Encoding.ASCII.GetBytes(ipEndPointString, destinationSpan);
+
+        return ipEndPointString.Length + 1;
+    }
+
+    private void SendFromBuffer(int length, bool toHostOnly = false)
+    {
+        var bytes = new Span<byte>(_buffer, 0, length);
+
+        if (toHostOnly)
+        {
+            _udpClient.Client.SendTo(bytes, _hostEndPoint);
+            return;
+        }
+
+        foreach (var peer in _peers)
+        {
+            _udpClient.Client.SendTo(bytes, peer);
+        }
+    }
+
+    public void Poll()
+    {
+        if (IsHost)
+        {
+            switch (_state)
+            {
+                case State.InLobby:
+                    HostPollInLobby();
+                    break;
+                case State.StartingGame:
+                    HostPollStartingGame();
+                    break;
+                case State.InGame:
+                    HostPollInGame();
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException();
+            }
+
+            return;
+        }
+
+        switch (_state)
+        {
+            case State.InLobby:
+                PollInLobby();
+                break;
+            case State.StartingGame:
+                PollStartingGame();
+                break;
+            case State.InGame:
+                PollInGame();
+                break;
+            default:
+                throw new ArgumentOutOfRangeException();
+        }
+    }
+
+    private void HostPollInLobby()
+    {
+        var receivedSpan = Receive(ref _cachedEndPoint);
+        if (receivedSpan.Length == 0) return;
+
+        var packetType = (PacketType)receivedSpan[0];
+
+        switch (packetType)
+        {
+            case PacketType.Hello:
+                if (_peers.Count >= MaxPeers)
+                {
+                    Console.WriteLine("Failed to accept new peer, max peers already reached!");
+                    return;
+                }
+
+                // Accept a new peer.
+                // TODO: Handle disconnecting inactive peers.
+                if (!IsHost || _peers.Contains(_cachedEndPoint))
+                {
+                    break;
+                }
+
+                // Save the new peer.
+                _peers.Add(_cachedEndPoint);
+
+                break;
+            default:
+                Console.WriteLine($"Got invalid packet, #{receivedSpan[0]}!");
+                break;
+        }
+    }
+
+    private void HostPollStartingGame()
+    {
+
+    }
+
+    private void HostPollInGame()
+    {
+        var receivedSpan = Receive(ref _cachedEndPoint);
+        if (receivedSpan.Length == 0) return;
+
+        var packetType = (PacketType)receivedSpan[0];
+
+        switch (packetType)
+        {
+            case PacketType.Message:
+                var sender = _cachedEndPoint == _hostEndPoint ? "host peer" : "other peer";
+                var messageSpan = new Span<byte>(_buffer, 1, receivedSpan.Length - 1);
+                var receivedMessage = Encoding.ASCII.GetString(messageSpan);
+                Console.WriteLine($"Received from {sender}: {receivedMessage}");
+                break;
+            default:
+                Console.WriteLine($"Got invalid packet, #{receivedSpan[0]}!");
+                break;
+        }
+    }
+
+    private void PollInLobby()
+    {
+        SendHelloToHost();
+
+        var receivedSpan = Receive(ref _cachedEndPoint);
+        if (receivedSpan.Length == 0) return;
+
+        var packetType = (PacketType)receivedSpan[0];
+    }
+
+    private void PollStartingGame()
+    {
+
+    }
+
+    private void PollInGame()
+    {
+
+    }
+
+    private Span<byte> Receive(ref EndPoint endPoint)
+    {
+        if (_udpClient.Available == 0) return new Span<byte>();
+
+        var destinationSpan = new Span<byte>(_buffer, 0, BufferSize);
+        var receivedCount = _udpClient.Client.ReceiveFrom(destinationSpan, ref endPoint);
+        return new Span<byte>(_buffer, 0, receivedCount);
+    }
+
+    private IPEndPoint CreateIpEndPoint(string ip, int port)
+    {
+        var ipHostInfo = Dns.GetHostEntry(ip);
+        var ipAddress = ipHostInfo.AddressList.First(x => x.AddressFamily == AddressFamily.InterNetwork);
+        return new IPEndPoint(ipAddress, port);
+    }
+
+    public void Dispose()
+    {
+        _udpClient.Dispose();
+    }
+}
