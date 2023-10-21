@@ -8,28 +8,38 @@ public class DeterministicGame
     private const int PlayerSpeed = 2;
 
     public Point WallPosition => _wallPosition;
-    public Point PlayerPosition => _playerPosition;
+    public readonly Point[] PlayerPositions;
 
     private Point _wallPosition = new(128, 128);
     private Point _wallSize = new(64, 64);
 
-    private Point _playerPosition = new(0, 0);
 
-    public void DeterministicStep(InputState inputState)
+    public DeterministicGame(int playerCount)
     {
-        var playerMotionX = Math.Sign(inputState.AxisX) * PlayerSpeed;
-        var playerMotionY = Math.Sign(inputState.AxisY) * PlayerSpeed;
+        PlayerPositions = new Point[playerCount];
+    }
 
-        if (!IsColliding(_playerPosition.X + playerMotionX, _playerPosition.Y, 64, 64,
-                _wallPosition.X, _wallPosition.Y, _wallSize.X, _wallSize.Y))
+    public void DeterministicStep(InputState[] inputStates)
+    {
+        for (var i = 0; i < PlayerPositions.Length; i++)
         {
-            _playerPosition.X += playerMotionX;
-        }
+            ref var inputState = ref inputStates[i];
+            ref var playerPosition = ref PlayerPositions[i];
 
-        if (!IsColliding(_playerPosition.X, _playerPosition.Y + playerMotionY, 64, 64,
-                _wallPosition.X, _wallPosition.Y, _wallSize.X, _wallSize.Y))
-        {
-            _playerPosition.Y += playerMotionY;
+            var playerMotionX = Math.Sign(inputState.AxisX) * PlayerSpeed;
+            var playerMotionY = Math.Sign(inputState.AxisY) * PlayerSpeed;
+
+            if (!IsColliding(playerPosition.X + playerMotionX, playerPosition.Y, 64, 64,
+                    _wallPosition.X, _wallPosition.Y, _wallSize.X, _wallSize.Y))
+            {
+                playerPosition.X += playerMotionX;
+            }
+
+            if (!IsColliding(playerPosition.X, playerPosition.Y + playerMotionY, 64, 64,
+                    _wallPosition.X, _wallPosition.Y, _wallSize.X, _wallSize.Y))
+            {
+                playerPosition.Y += playerMotionY;
+            }
         }
     }
 

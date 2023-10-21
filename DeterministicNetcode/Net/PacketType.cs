@@ -3,7 +3,7 @@
 public enum PacketType : byte
 {
     Hello,
-    Message,
     AddPeers,
-    Acknowledge
+    Acknowledge,
+    InputState
 }

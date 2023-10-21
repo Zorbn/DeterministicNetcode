@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Net.Sockets;
 using DeterministicNetcode.Net;
 using Microsoft.Xna.Framework;
@@ -21,11 +22,15 @@ public class Game1 : Game
     private enum State
     {
         MainMenu,
+        Lobby,
+        // Unlike the starting game net state, this state exists just to give visual feedback to the host
+        // when they try to start the game. Non-hosts will stay in the lobby while the net peer coordinates
+        // starting the game behind the scenes.
+        StartingGame,
         InGame
     }
 
-    private const int StepsPerSecond = 60;
-
+    private const int StepsPerSecond = 600;
     private const float StepTime = 1f / StepsPerSecond;
 
     private GraphicsDeviceManager _graphics;
@@ -33,9 +38,11 @@ public class Game1 : Game
     private Texture2D _smileyTexture, _wallTexture;
 
     private double _stepTimer;
+    private int _stepCount;
 
-    private InputState _bufferedLocalInput;
-    private readonly DeterministicGame _deterministicGame = new();
+    private readonly List<InputState> _bufferedLocalInputs = new();
+    private InputState[] _inputStates;
+    private DeterministicGame _deterministicGame;
     private State _state = State.MainMenu;
     private INetPeer _netPeer;
 
@@ -44,6 +51,11 @@ public class Game1 : Game
         _graphics = new GraphicsDeviceManager(this);
         Content.RootDirectory = "Content";
         IsMouseVisible = true;
+
+        IsFixedTimeStep = false;
+        _graphics.SynchronizeWithVerticalRetrace = false;
+
+        InactiveSleepTime = TimeSpan.Zero;
     }
 
     protected override void Initialize()
@@ -67,10 +79,18 @@ public class Game1 : Game
             keyboardState.IsKeyDown(Keys.Escape))
             Exit();
 
+        Window.Title = $"{Math.Ceiling(1f / gameTime.ElapsedGameTime.TotalSeconds)} fps, {_stepCount} steps";
+
         switch (_state)
         {
             case State.MainMenu:
                 UpdateMainMenu(keyboardState);
+                break;
+            case State.Lobby:
+                UpdateLobby(keyboardState);
+                break;
+            case State.StartingGame:
+                UpdateStartingGame();
                 break;
             case State.InGame:
                 UpdateInGame(gameTime, keyboardState);
@@ -88,8 +108,9 @@ public class Game1 : Game
         {
             // Start the server.
             _netPeer = new NetHost();
-            _state = State.InGame;
-            Console.WriteLine($"Started server with port: {_netPeer.Port}");
+            _state = State.Lobby;
+            Console.WriteLine($"Started server with port: {_netPeer.Messenger.Port}");
+            Console.WriteLine("Press SPACE when you're ready to start the game.");
             return;
         }
 
@@ -122,37 +143,83 @@ public class Game1 : Game
                 break;
             }
 
+            _state = State.Lobby;
+            return;
+        }
+    }
+
+    private void UpdateLobby(KeyboardState keyboardState)
+    {
+        _netPeer.Poll(_stepCount);
+
+        if (_netPeer.State == NetState.InGame)
+        {
             _state = State.InGame;
             return;
+        }
+
+        if (_netPeer.IsHost && keyboardState.IsKeyDown(Keys.Space))
+        {
+            var netHost = (NetHost)_netPeer;
+            netHost.BeginStartingGame();
+            _state = State.StartingGame;
+        }
+    }
+
+    private void UpdateStartingGame()
+    {
+        _netPeer.Poll(_stepCount);
+
+        if (_netPeer.State == NetState.InGame)
+        {
+            _state = State.InGame;
         }
     }
 
     private void UpdateInGame(GameTime gameTime, KeyboardState keyboardState)
     {
-        _netPeer.Poll();
-
-        if (keyboardState.IsKeyDown(Keys.M))
+        if (_deterministicGame is null)
         {
-            // _net.SendMessageToAll($"Hello world @ {gameTime.TotalGameTime.Seconds}");
+            var playerCount = _netPeer.Messenger.PeerCount + 1;
+            _deterministicGame = new DeterministicGame(playerCount);
+            _inputStates = new InputState[playerCount];
         }
 
+        _netPeer.Poll(_stepCount);
         _stepTimer += gameTime.ElapsedGameTime.TotalSeconds;
 
-        var axisX = 0;
-        var axisY = 0;
-
-        if (keyboardState.IsKeyDown(Keys.Left)) axisX -= 1;
-        if (keyboardState.IsKeyDown(Keys.Right)) axisX += 1;
-        if (keyboardState.IsKeyDown(Keys.Up)) axisY -= 1;
-        if (keyboardState.IsKeyDown(Keys.Down)) axisY += 1;
-
-        _bufferedLocalInput.AxisX = axisX;
-        _bufferedLocalInput.AxisY = axisY;
-
-        while (_stepTimer > StepTime)
+        if (_bufferedLocalInputs.Count == 0 || _bufferedLocalInputs[^1].StepIndex < _stepCount)
         {
+            var axisX = 0;
+            var axisY = 0;
+
+            if (keyboardState.IsKeyDown(Keys.Left)) axisX -= 1;
+            if (keyboardState.IsKeyDown(Keys.Right)) axisX += 1;
+            if (keyboardState.IsKeyDown(Keys.Up)) axisY -= 1;
+            if (keyboardState.IsKeyDown(Keys.Down)) axisY += 1;
+
+            _bufferedLocalInputs.Add(new InputState { AxisX = axisX, AxisY = axisY, StepIndex = _stepCount});
+        }
+
+        while (_bufferedLocalInputs.Count > InputState.SavedInputStateCount) _bufferedLocalInputs.RemoveAt(0);
+
+        _netPeer.Messenger.SendInputState(_bufferedLocalInputs);
+
+        if (_stepTimer > StepTime && _netPeer.Messenger.HasAllPeerInputStates())
+        {
+            for (var i = 0; i < _netPeer.Messenger.PeerCount; i++)
+            {
+                _inputStates[i] = _netPeer.Messenger.PeerInputStates[i]!.Value;
+            }
+
+            _inputStates[_netPeer.Messenger.PeerCount] = _bufferedLocalInputs[^1];
+
             _stepTimer -= StepTime;
-            _deterministicGame.DeterministicStep(_bufferedLocalInput);
+            _deterministicGame.DeterministicStep(_inputStates);
+
+            _netPeer.Messenger.ClearInputStates();
+
+            _stepCount++;
         }
     }
 
@@ -164,6 +231,12 @@ public class Game1 : Game
         {
             case State.MainMenu:
                 DrawMainMenu();
+                break;
+            case State.Lobby:
+                DrawLobby();
+                break;
+            case State.StartingGame:
+                DrawStartingGame();
                 break;
             case State.InGame:
                 DrawInGame();
@@ -180,10 +253,25 @@ public class Game1 : Game
 
     }
 
+    private void DrawLobby()
+    {
+
+    }
+
+    private void DrawStartingGame()
+    {
+
+    }
+
     private void DrawInGame()
     {
+        if (_deterministicGame is null) return;
+
         _spriteBatch.Begin();
-        _spriteBatch.Draw(_smileyTexture, _deterministicGame.PlayerPosition.ToVector2(), Color.White);
+        foreach (var playerPosition in _deterministicGame.PlayerPositions)
+        {
+            _spriteBatch.Draw(_smileyTexture, playerPosition.ToVector2(), Color.White);
+        }
         _spriteBatch.Draw(_wallTexture, _deterministicGame.WallPosition.ToVector2(), Color.White);
         _spriteBatch.End();
     }

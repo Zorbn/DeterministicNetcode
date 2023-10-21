@@ -1,23 +1,38 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
 using System.Net;
-using System.Net.Sockets;
 using System.Text;
 
 namespace DeterministicNetcode.Net;
 
 public class NetHost : INetPeer
 {
-    public int Port => _messenger.Port;
+    // Peers that take more than this long to start when told to do so
+    // will be disconnected from the game.
+    // TODO: Notify peers about disconnections.
+    // TODO: Or go back to the lobby/main menu and the players have to restart if somebody disconnects.
+    private const float StartingGameTime = 1.0f;
 
-    private NetMessenger _messenger = new();
+    public bool IsHost => true;
+    public NetState State => _state;
+    public NetMessenger Messenger { get; } = new();
+
     private NetState _state = NetState.InLobby;
 
-    // Used to store the result of Receive.
-    private EndPoint _cachedEndPoint = new IPEndPoint(IPAddress.Any, 0);
+    private bool[] _havePeersStarted;
+    // TODO: The host and peers should end the game if they stop receiving messages.
+    // TODO: private float _startingGameTimer;
 
-    public void Poll()
+    // Used to store the result of Receive.
+    private IPEndPoint _cachedEndPoint = new(IPAddress.Any, 0);
+
+    public void BeginStartingGame()
+    {
+        if (_state != NetState.InLobby) return;
+        _state = NetState.StartingGame;
+        _havePeersStarted = new bool[Messenger.PeerCount];
+    }
+
+    public void Poll(int stepIndex)
     {
         switch (_state)
         {
@@ -28,7 +43,7 @@ public class NetHost : INetPeer
                 PollStartingGame();
                 break;
             case NetState.InGame:
-                PollInGame();
+                PollInGame(stepIndex);
                 break;
             default:
                 throw new ArgumentOutOfRangeException();
@@ -37,74 +52,102 @@ public class NetHost : INetPeer
 
     private void PollInLobby()
     {
-        var receivedSpan = _messenger.Receive(ref _cachedEndPoint);
-        if (receivedSpan.Length == 0) return;
-
-        var packetType = (PacketType)receivedSpan[0];
-
-        switch (packetType)
+        while (true)
         {
-            case PacketType.Hello:
-                if (_messenger.Peers.Count >= NetMessenger.MaxPeers)
-                {
-                    Console.WriteLine("Failed to accept new peer, max peers already reached!");
-                    return;
-                }
+            var receivedSpan = Messenger.Receive(ref _cachedEndPoint);
+            if (receivedSpan.Length == 0) break;
 
-                // If the peer doesn't receive acknowledgement they will keep saying hello,
-                // until an acknowledgement is successfully received.
-                _messenger.SendAcknowledgement(PacketType.Hello, _cachedEndPoint);
-                _messenger.Peers.Add(_cachedEndPoint);
+            var packetType = (PacketType)receivedSpan[0];
 
-                break;
-            default:
-                Console.WriteLine($"Got invalid packet, #{receivedSpan[0]}!");
-                break;
+            switch (packetType)
+            {
+                case PacketType.Hello:
+                    if (Messenger.PeerCount >= NetMessenger.MaxPeers)
+                    {
+                        Console.WriteLine("Failed to accept new peer, max peers already reached!");
+                        break;
+                    }
+
+                    // If the peer doesn't receive acknowledgement they will keep saying hello,
+                    // until an acknowledgement is successfully received.
+                    Messenger.SendAcknowledgement(PacketType.Hello, _cachedEndPoint);
+
+                    if (!Messenger.HasPeer(_cachedEndPoint)) Messenger.AddPeer(_cachedEndPoint);
+
+                    break;
+                default:
+                    Console.WriteLine($"Got invalid packet, #{receivedSpan[0]}!");
+                    break;
+            }
         }
     }
 
     private void PollStartingGame()
     {
+        var isWaitingOnPeer = false;
 
+        for (var i = 0; i < _havePeersStarted.Length; i++)
+        {
+            if (_havePeersStarted[i]) continue;
+
+            isWaitingOnPeer = true;
+            SendAddPeers(i);
+        }
+
+        if (!isWaitingOnPeer)
+        {
+            _state = NetState.InGame;
+            return;
+        }
+
+        while (true)
+        {
+            var receivedSpan = Messenger.Receive(ref _cachedEndPoint);
+            if (receivedSpan.Length == 0) break;
+            if (!NetMessenger.IsAcknowledgement(PacketType.AddPeers, receivedSpan)) continue;
+
+            for (var i = 0; i < Messenger.PeerCount; i++)
+            {
+                if (!Messenger.Peers[i].Equals(_cachedEndPoint)) continue;
+
+                _havePeersStarted[i] = true;
+                break;
+            }
+        }
     }
 
-    private void PollInGame()
+    private void PollInGame(int stepIndex)
     {
-        // var receivedSpan = Receive(ref _cachedEndPoint);
-        // if (receivedSpan.Length == 0) return;
-        //
-        // var packetType = (PacketType)receivedSpan[0];
-        //
-        // switch (packetType)
-        // {
-        //     case PacketType.Message:
-        //         var sender = _cachedEndPoint == _hostEndPoint ? "host peer" : "other peer";
-        //         var messageSpan = new Span<byte>(_buffer, 1, receivedSpan.Length - 1);
-        //         var receivedMessage = Encoding.ASCII.GetString(messageSpan);
-        //         Console.WriteLine($"Received from {sender}: {receivedMessage}");
-        //         break;
-        //     default:
-        //         Console.WriteLine($"Got invalid packet, #{receivedSpan[0]}!");
-        //         break;
-        // }
+        while (true)
+        {
+            var receivedSpan = Messenger.Receive(ref _cachedEndPoint);
+            if (receivedSpan.Length == 0) break;
+
+            var packetType = (PacketType)receivedSpan[0];
+
+            switch (packetType)
+            {
+                case PacketType.InputState:
+                    Messenger.HandleInputState(_cachedEndPoint, stepIndex);
+                    break;
+            }
+        }
     }
 
-    public void SendMessageToAll(string message)
+    private void SendAddPeers(int toIndex)
     {
-        _messenger.Buffer[0] = (byte)PacketType.Message;
-        Encoding.ASCII.GetBytes(message, new Span<byte>(_messenger.Buffer, 1, message.Length));
-        _messenger.SendFromBuffer(message.Length + 1);
-    }
-
-    private void SendAddPeersToAll()
-    {
-        _messenger.Buffer[0] = (byte)PacketType.AddPeers;
-        _messenger.Buffer[1] = (byte)_messenger.Peers.Count;
+        Messenger.Buffer[0] = (byte)PacketType.AddPeers;
+        Messenger.Buffer[1] = (byte)Messenger.PeerCount;
+        // Make sure not to tell the peer to add a copy of it's own end point.
+        if (Messenger.Buffer[1] > 0) Messenger.Buffer[1]--;
 
         var currentOffset = 2;
 
-        foreach (var peer in _messenger.Peers)
+        for (var i = 0; i < Messenger.PeerCount; i++)
         {
+            if (i == toIndex) continue;
+            var peer = Messenger.Peers[i];
+
             var bytesWritten = WritePeerToBuffer(peer, currentOffset);
 
             if (bytesWritten == 0)
@@ -116,23 +159,17 @@ public class NetHost : INetPeer
             currentOffset += bytesWritten;
         }
 
-        _messenger.SendFromBuffer(currentOffset);
+        Messenger.SendFromBuffer(currentOffset, Messenger.Peers[toIndex]);
     }
 
-    private int WritePeerToBuffer(EndPoint peer, int offset)
+    private int WritePeerToBuffer(IPEndPoint peer, int offset)
     {
-        if (peer is not IPEndPoint ipEndPoint)
-        {
-            Console.WriteLine($"Peer couldn't be converted to an IP endpoint: {peer}");
-            return 0;
-        }
+        var ipEndPointString = peer.ToString();
 
-        var ipEndPointString = ipEndPoint.ToString();
-
-        _messenger.Buffer[offset] = (byte)ipEndPointString.Length;
+        Messenger.Buffer[offset] = (byte)ipEndPointString.Length;
         offset++;
 
-        var destinationSpan = new Span<byte>(_messenger.Buffer, offset, _messenger.Buffer.Length - offset);
+        var destinationSpan = new Span<byte>(Messenger.Buffer, offset, Messenger.Buffer.Length - offset);
         Encoding.ASCII.GetBytes(ipEndPointString, destinationSpan);
 
         return ipEndPointString.Length + 1;
@@ -140,6 +177,6 @@ public class NetHost : INetPeer
 
     public void Dispose()
     {
-        _messenger.Dispose();
+        Messenger.Dispose();
     }
 }
