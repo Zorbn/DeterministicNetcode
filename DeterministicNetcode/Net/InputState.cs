@@ -1,6 +1,6 @@
 ﻿using System;
 
-namespace DeterministicNetcode;
+namespace DeterministicNetcode.Net;
 
 public struct InputState
 {

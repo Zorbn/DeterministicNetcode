@@ -1,4 +1,5 @@
 ﻿using System;
+using DeterministicNetcode.Net;
 using Microsoft.Xna.Framework;
 
 namespace DeterministicNetcode;

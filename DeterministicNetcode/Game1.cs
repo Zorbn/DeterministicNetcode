@@ -33,12 +33,16 @@ public class Game1 : Game
     private const int StepsPerSecond = 600;
     private const float StepTime = 1f / StepsPerSecond;
 
+    private const float TitleUpdateTime = 1f;
+
     private GraphicsDeviceManager _graphics;
     private SpriteBatch _spriteBatch;
     private Texture2D _smileyTexture, _wallTexture;
 
     private double _stepTimer;
     private int _stepCount;
+
+    private double _titleUpdateTimer;
 
     private readonly List<InputState> _bufferedLocalInputs = new();
     private InputState[] _inputStates;
@@ -79,7 +83,12 @@ public class Game1 : Game
             keyboardState.IsKeyDown(Keys.Escape))
             Exit();
 
-        Window.Title = $"{Math.Ceiling(1f / gameTime.ElapsedGameTime.TotalSeconds)} fps, {_stepCount} steps";
+        _titleUpdateTimer += gameTime.ElapsedGameTime.TotalSeconds;
+        if (_titleUpdateTimer > TitleUpdateTime)
+        {
+            _titleUpdateTimer -= TitleUpdateTime;
+            Window.Title = $"{Math.Ceiling(1f / gameTime.ElapsedGameTime.TotalSeconds)} fps, {_stepCount} steps";
+        }
 
         switch (_state)
         {
